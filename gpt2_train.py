@@ -29,11 +29,17 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        # y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
-        att = (q @ k.transpose(-2,-1)) * (1.0/ math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] ==0 , float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
+
+        # you can use below 4 lines instead of flash attention by pytorch. 
+        # but the memory to gpu kernel read/write times decreases significanlty using flash attention. 
+        # also, the online softmax calculation is performed in flash attention that makes the computation much faster compared to normal softmax
+        # achieving 5000ms /step, previously 11k ms/step time.
+
+        # att = (q @ k.transpose(-2,-1)) * (1.0/ math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:,:,:T,:T] ==0 , float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v
         # .contiguous() stores a copy of tensor in the memory.
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side.
         # output projection
@@ -232,18 +238,36 @@ train_loader = DataLoader(4, 1024)
 torch.set_float32_matmul_precision('high')
 
 # model = GPT.from_pretrained('gpt2')
-model = GPT(GPTConfig()) # random model initilaization
+model = GPT(GPTConfig(vocab_size = 50304)) # random model initilaization, making the vocab_size power of 2, to make computation faster. 
+# increasing the vocab size to 50304: 3k-4k ms / step from 5k-6k ms/step time. 
 model.to(device)
 
 # in general the python interpreter executes in eager mode- goes through each layer one by one
+# decreases the read-write operations between memory and kernels.
 # compiler here takes the entire architecture as an object and performs training, hence the increase in speed. 
 # require python 3.10-dev version to run torch.compile, not compatible with latest version of python. 
 # torch.compile is not compatible with windows, you need linux or WSL on windows machine.
 model = torch.compile(model)
 
+# lr scheduler from gpt3 paper.
+import math
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+def get_lr(it):
+    if it < warmup_steps:
+        return max_lr * (it+1) / warmup_steps
+    if it > max_steps:
+        return min_lr
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5* (1.0+math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)
+
 import time
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50): 
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas = (0.9, 0.95), eps = 1e-8) # betas and eps from gpt-3 paper.
+for step in range(max_steps): 
     t0 = time.time()
     x, y = train_loader.next_batch()
     x ,y = x.to(device), y.to(device)
@@ -254,12 +278,19 @@ for i in range(50):
     with torch.autocast(device_type= device, dtype=torch.bfloat16):
         logits, loss = model(x, y)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # from gpt 3 paper. clip to mo more than 1.0
+
+    #cosine learning rate
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr # set the lr manually, cosine lr ends here.
+
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0)*1000
     tokens_per_sec = (train_loader.B * train_loader.T) / (t1-t0)
-    print(f"step {i} loss: {loss.item()}, dt: {dt:.2f}ms, tokens/sec: {tokens_per_sec:.2f}")
+    print(f"step {step} | loss: {loss.item():.6f} | lr: {lr} | norm: {norm:.4f} | dt: {dt:.2f}ms, | tokens/sec: {tokens_per_sec:.2f}")
 
 
 # torch.manual_seed(42)
