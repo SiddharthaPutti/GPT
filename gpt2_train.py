@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+# pip install torch==2.0.1+cu117 torchvision==0.15.2+cu117 torchaudio==2.0.2+cu117 -f https://download.pytorch.org/whl/torch_stable.html
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -183,7 +184,7 @@ class GPT(nn.Module):
 
         return model
 
-
+# pip install tiktoken
 import tiktoken
 
 class DataLoader:
@@ -191,7 +192,7 @@ class DataLoader:
         self.B =B
         self.T = T
         
-        with open('GPT\input.txt', 'r') as f:
+        with open('input.txt', 'r') as f:
             text = f.read()
         enc = tiktoken.get_encoding('gpt2')    
         tokens = enc.encode(text)
@@ -224,22 +225,41 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-train_loader = DataLoader(4, 32)
+
+train_loader = DataLoader(4, 1024)
+# uses tffloat 32 for all other layers that are not scale downed by autocast. this is a bit faster than float32 precision bits. 
+# this reduced the time for each step from 20k ms to 15k ms
+torch.set_float32_matmul_precision('high')
 
 # model = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig()) # random model initilaization
 model.to(device)
-# logits, loss = model(x, y)
 
+# in general the python interpreter executes in eager mode- goes through each layer one by one
+# compiler here takes the entire architecture as an object and performs training, hence the increase in speed. 
+# require python 3.10-dev version to run torch.compile, not compatible with latest version of python. 
+# torch.compile is not compatible with windows, you need linux or WSL on windows machine.
+model = torch.compile(model)
+
+import time
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50): 
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x ,y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+
+    # this make some of the layers like MLP into float 16 bit. runs much faster. 
+    # this reduced the time for each step from 15k ms to 11k ms
+    with torch.autocast(device_type= device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    print(f"step {i} loss: {loss.item()}")
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0)*1000
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1-t0)
+    print(f"step {i} loss: {loss.item()}, dt: {dt:.2f}ms, tokens/sec: {tokens_per_sec:.2f}")
 
 
 # torch.manual_seed(42)
