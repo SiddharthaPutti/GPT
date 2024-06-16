@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
+import inspect
 
 class CausalSelfAttention(nn.Module):
 
@@ -189,6 +190,24 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
+    
+    def configureOptimizer(self, weight_decay, learning_rate, device):
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups, any param that is 2D will be decayed esle no
+        # which is all weight tensors in matmul + embd decays, all bias and layer norms dont. 
+        decay_params = [p for n, p in param_dict.items() if p.dim() >=2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+
+        optim_groups = [{'params': decay_params, 'weight_decay':weight_decay, 
+                        'params': nodecay_params, 'weight_decay': 0.0}]
+
+        # kernel fusion - implimenting this, down to 2k ms/steps time.
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+
+        optimizer = torch.optim.AdamW(optim_groups, lr = learning_rate, fused= use_fused, betas = (0.9, 0.95), eps = 1e-8)
+        return optimizer
 
 # pip install tiktoken
 import tiktoken
@@ -266,7 +285,11 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 import time
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas = (0.9, 0.95), eps = 1e-8) # betas and eps from gpt-3 paper.
+
+# commenting this for implimenting weight decay
+# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas = (0.9, 0.95), eps = 1e-8) # betas and eps from gpt-3 paper.
+
+optimizer = model.configureOptimizer(weight_decay = 0.1, learning_rate = 6e-4, device= device)
 for step in range(max_steps): 
     t0 = time.time()
     x, y = train_loader.next_batch()
