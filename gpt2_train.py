@@ -250,6 +250,14 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
+# gradient accumulation for bigger batch sizes: 
+# commenting them, because my gpu takes much time to perform gradient acuumulaiton. 
+# total_batch_size = 524288
+# B = 4
+# T = 1024
+# assert total_batch_size % (B*T) == 0 
+# grad_accum_steps = total_batch_size // (B*T)
+
 
 train_loader = DataLoader(4, 1024)
 # uses tffloat 32 for all other layers that are not scale downed by autocast. this is a bit faster than float32 precision bits. 
@@ -292,15 +300,26 @@ import time
 optimizer = model.configureOptimizer(weight_decay = 0.1, learning_rate = 6e-4, device= device)
 for step in range(max_steps): 
     t0 = time.time()
+
     x, y = train_loader.next_batch()
     x ,y = x.to(device), y.to(device)
     optimizer.zero_grad()
-
-    # this make some of the layers like MLP into float 16 bit. runs much faster. 
-    # this reduced the time for each step from 15k ms to 11k ms
     with torch.autocast(device_type= device, dtype=torch.bfloat16):
         logits, loss = model(x, y)
+
     loss.backward()
+
+    # commenting them, because my gpu takes much time to perform gradient acuumulaiton. 
+    # for micro_step in range(grad_accum_steps):
+    #     x, y = train_loader.next_batch()
+    #     x ,y = x.to(device), y.to(device)
+    #     # this make some of the layers like MLP into float 16 bit. runs much faster. 
+    #     # this reduced the time for each step from 15k ms to 11k ms
+    #     with torch.autocast(device_type= device, dtype=torch.bfloat16):
+    #         logits, loss = model(x, y)
+    #     loss = loss / grad_accum_steps
+    #     loss.backward()
+
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # from gpt 3 paper. clip to mo more than 1.0
 
     #cosine learning rate
