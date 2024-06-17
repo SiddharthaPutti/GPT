@@ -211,19 +211,44 @@ class GPT(nn.Module):
 
 # pip install tiktoken
 import tiktoken
+import os
+import numpy as np
+def load_tokens(filename): 
+    npt = np.load(filename)
+    npt = npt.astype(np.float32)
+    ppt = torch.tensor(npt, dtype = torch.long)
+    return ppt
 
 class DataLoader:
-    def __init__(self, B, T):
+    def __init__(self, B, T, split):
         self.B =B
         self.T = T
-        
-        with open('input.txt', 'r') as f:
-            text = f.read()
-        enc = tiktoken.get_encoding('gpt2')    
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
+        assert split in {'train', 'val'}
 
-        self.current_pos = 0
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_pos = self.B * self.T 
+
+        # with open('input.txt', 'r') as f:
+        #     text = f.read()
+        # enc = tiktoken.get_encoding('gpt2')    
+        # tokens = enc.encode(text)
+        # self.tokens = torch.tensor(tokens)
+
+        # self.current_pos = 0
+        self.reset()
+
+    def reset(self): 
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_pos = self.B * self.T
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -233,7 +258,9 @@ class DataLoader:
 
         self.current_pos += B*T
         if self.current_pos + (B*T+1) > len(self.tokens):
-            self.current_pos = 0
+            self.current_shard = (self.current_shard +1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_pos = B* T
 
         return x, y
         
@@ -258,8 +285,10 @@ if torch.cuda.is_available():
 # assert total_batch_size % (B*T) == 0 
 # grad_accum_steps = total_batch_size // (B*T)
 
-
-train_loader = DataLoader(4, 1024)
+B = 4 # batch size
+T = 1024 # token length
+train_loader = DataLoader(B, T, split = 'train')
+val_loader = DataLoader(B, T, split = 'val')
 # uses tffloat 32 for all other layers that are not scale downed by autocast. this is a bit faster than float32 precision bits. 
 # this reduced the time for each step from 20k ms to 15k ms
 torch.set_float32_matmul_precision('high')
@@ -280,8 +309,8 @@ model = torch.compile(model)
 import math
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50
+warmup_steps = 715
+max_steps = 19073
 def get_lr(it):
     if it < warmup_steps:
         return max_lr * (it+1) / warmup_steps
@@ -301,6 +330,23 @@ optimizer = model.configureOptimizer(weight_decay = 0.1, learning_rate = 6e-4, d
 for step in range(max_steps): 
     t0 = time.time()
 
+    if step % 100 ==0: 
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 100
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast(device_type=device, dtype = torch.bfloat16):
+                    logits, loss = model(x,y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+            print(f"validation loss: {val_loss_accum:.4f}")
+    
+    # training loop
+    model.train()
     x, y = train_loader.next_batch()
     x ,y = x.to(device), y.to(device)
     optimizer.zero_grad()
