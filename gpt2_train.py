@@ -8,7 +8,7 @@ import inspect
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, sliding_window = False, window_size = 128):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # batched q,k,v projections 
@@ -19,8 +19,16 @@ class CausalSelfAttention(nn.Module):
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        self.sliding_window = sliding_window
+        self.window_size = window_size
         # not really a 'bias', more of a mask, but following the OpenAI/HF naming though
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+        if self.sliding_window: 
+            window_mask = torch.triu(torch.ones(config.block_size, config.block_size), 1-self.window_size)
+            casual_mask = torch.tril(torch.ones(config.block_size, config.block_size))
+            combined_mask = casual_mask - window_mask
+            self.register_buffer("bias", combined_mask.view(1,1,config.block_size, config.block_size))
+        else:
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                      .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
@@ -30,17 +38,22 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
+        # y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
 
         # you can use below 4 lines instead of flash attention by pytorch. 
         # but the memory to gpu kernel read/write times decreases significanlty using flash attention. 
         # also, the online softmax calculation is performed in flash attention that makes the computation much faster compared to normal softmax
         # achieving 5000ms /step, previously 11k ms/step time.
 
-        # att = (q @ k.transpose(-2,-1)) * (1.0/ math.sqrt(k.size(-1)))
-        # att = att.masked_fill(self.bias[:,:,:T,:T] ==0 , float('-inf'))
-        # att = F.softmax(att, dim=-1)
-        # y = att @ v
+        att = (q @ k.transpose(-2,-1)) * (1.0/ math.sqrt(k.size(-1)))
+        if not self.sliding_window: 
+            att = att.masked_fill(self.bias[:,:,:T,:T] ==0 , float('-inf'))
+        else: 
+            att = att.masked_fill(self.bias[:,:,:T,:T] == -1, float('-inf'))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 1, float('-inf'))
+        
+        att = F.softmax(att, dim=-1)
+        y = att @ v
         # .contiguous() stores a copy of tensor in the memory.
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side.
         # output projection
@@ -67,7 +80,7 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = CausalSelfAttention(config)
+        self.attn = CausalSelfAttention(config, sliding_window=True, window_size=128)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
