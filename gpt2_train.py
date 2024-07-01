@@ -5,10 +5,11 @@ import torch.nn as nn
 from torch.nn import functional as F
 import math
 import inspect
+import dataloader
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config, sliding_window = False, window_size = 128):
+    def __init__(self, config, sliding_window = False, grouped_query = False ):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # batched q,k,v projections 
@@ -20,23 +21,61 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.sliding_window = sliding_window
-        self.window_size = window_size
-        # not really a 'bias', more of a mask, but following the OpenAI/HF naming though
+        self.grouped_query = grouped_query
+        self.window_size = config.window_size
+
+        # grouped query attention with kv-cache
+        # if self.grouped_query: 
+        #     self.n_kv_heads = config.n_head if config.n_kv_heads is None else config.n_kv_heads # number of heads for key and value
+        #     self.n_head_q = config.n_head # number of heads for queries
+        #     self.n_rep = self.n_head_q // self.n_kv_heads # no of times heads of k,v needs to be repeated to match q heads
+        #     self.head_dim = self.n_embd // self.n_head # dim of each head
+
+        #     self.linear_q = nn.Linear(self.n_embd, self.n_embd) # linear projection of queries
+        #     self.linear_kv = nn.Linear(self.n_embd , 2 * self.n_kv_heads * self.head_dim) # k,v linear projection 
+
+        #     self.k_cache = torch.zeros((config.batch_size, config.seq_length, self.n_kv_heads, self.head_dim))
+        #     self.v_cache = torch.zeros((config.batch_size, config.seq_length, self.n_kv_heads, self.head_dim))
+
+
+
         if self.sliding_window: 
-            window_mask = torch.triu(torch.ones(config.block_size, config.block_size), 1-self.window_size)
-            casual_mask = torch.tril(torch.ones(config.block_size, config.block_size))
+            window_mask = torch.triu(torch.ones(config.block_size, config.block_size), 1-self.window_size) # upper triangle
+            casual_mask = torch.tril(torch.ones(config.block_size, config.block_size)) # lower triangle
             combined_mask = casual_mask - window_mask
+            # not really a 'bias', more of a mask, but following the OpenAI/HF naming though
             self.register_buffer("bias", combined_mask.view(1,1,config.block_size, config.block_size))
         else:
+            # not really a 'bias', more of a mask, but following the OpenAI/HF naming though
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                      .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, start_pos = None, freq = None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality
+        
+        # if self.grouped_query: 
+        #     q = self.linear_q(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        #     kv = self.linear_kv(x).view(B, T, 2, self.n_kv_heads, self.head_dim ) #(4, 1024, 512) (4, 1024, 2, 4, 64)
+        #     k, v = kv.unbind(2) # k (4, 1024, 4, 64)
+
+        #     k = k.transpose(1, 2) # (4, 4, 1024, 64)
+        #     v = v.transpose(1, 2)
+
+        #     self.k_cache[:B, start_pos:start_pos+ T] = k
+        #     self.v_cache[:B, start_pos:start_pos+ T] = v
+
+        #     k = self.k_cache[:B, :start_pos+T]
+        #     v = self.v_cache[:B, :start_pos+T]
+
+        #     k = k.repeat_interleave(self.n_rep, dim = 1)
+        #     v = v.repeat_interleave(self.n_rep, dim = 1)
+
+
+        # else:
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         # y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
 
@@ -80,7 +119,7 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = CausalSelfAttention(config, sliding_window=True, window_size=128)
+        self.attn = CausalSelfAttention(config, sliding_window=True)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
@@ -103,6 +142,10 @@ class GPTConfig:
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
+    window_size: int = 128 # window size for sliding window attention 
+    n_kv_heads: int = 4 # number of heads for key, value 
+    batch_size: int = 4 # max batch size
+    seq_length: int = 1024 # max sequence length 
 
 class GPT(nn.Module):
 
@@ -300,8 +343,8 @@ if torch.cuda.is_available():
 
 B = 4 # batch size
 T = 1024 # token length
-train_loader = DataLoader(B, T, split = 'train')
-val_loader = DataLoader(B, T, split = 'val')
+train_loader = dataloader.DataLoader(B, T, 'train')
+val_loader = dataloader.DataLoader(B, T, 'val')
 # uses tffloat 32 for all other layers that are not scale downed by autocast. this is a bit faster than float32 precision bits. 
 # this reduced the time for each step from 20k ms to 15k ms
 torch.set_float32_matmul_precision('high')
@@ -351,6 +394,8 @@ for step in range(max_steps):
             val_loss_steps = 100
             for _ in range(val_loss_steps):
                 x, y = val_loader.next_batch()
+                x = torch.from_numpy(x)
+                y = torch.from_numpy(y)
                 x, y = x.to(device), y.to(device)
                 with torch.autocast(device_type=device, dtype = torch.bfloat16):
                     logits, loss = model(x,y)
